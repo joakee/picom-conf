@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""wallpaper-sheet -- a wallpaper that can slide with the workspace.
+
+XFCE draws the backdrop on ONE screen-sized window (xfdesktop's), so sliding
+that window on a workspace switch would just drag a hole across the screen:
+there is nothing behind it, and the next workspace's copy of the wallpaper does
+not exist as a separate surface to slide in.
+
+So this puts a second, wider copy on top: one window per monitor, three monitor
+widths across, with the wallpaper repeated three times and the middle tile
+sitting exactly over the monitor. At rest it is indistinguishable from the
+backdrop -- same image, same place, same size. But because the image repeats
+every monitor width, picom can slide it a full width either way and the snap
+back when the animation ends is invisible: tile n lands exactly where tile n+1
+was. The seam between tiles is the boundary between two workspaces' wallpapers,
+which is what macOS shows when both spaces use the same picture.
+
+Details that matter:
+
+  * It is CLICK-THROUGH (empty input shape), so the desktop right-click menu
+    still belongs to xfdesktop underneath.
+  * It sits in the WM's "below" layer -- above the backdrop, below every
+    application window -- which is the same trick the conky cards use.
+  * Desktop ICONS are drawn on xfdesktop's own window and would be covered by
+    this, so it is only usable with /desktop-icons/style = 0 (icons off).
+  * If this process dies the desktop looks exactly the same, it just stops
+    sliding. xfdesktop's backdrop is still underneath.
+
+The slide itself is two rules in ~/.config/picom/picom.conf matching
+class_g = 'wallpaper-sheet', fired by ~/.local/bin/picom-slide-switch along with
+the conky cards. Those rules use `window-width / 3` as the travel distance
+rather than `window-monitor-width`, because a window three monitors wide is not
+contained in any one monitor and picom would hand back the whole virtual screen.
+
+Started from ~/.config/autostart/wallpaper-sheet.desktop.
+"""
+import os
+import signal
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib  # noqa: E402
+import cairo  # noqa: E402
+
+TILES = 3            # one visible, one spare each side
+POLL_SECONDS = 15    # how often to notice a wallpaper change
+
+
+def xfconf_backdrop():
+    """Every /backdrop/... key xfdesktop currently has, as a dict."""
+    try:
+        out = subprocess.run(
+            ["xfconf-query", "-c", "xfce4-desktop", "-lv"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    props = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].startswith("/backdrop/"):
+            props[parts[0]] = parts[1].strip()
+    return props
+
+
+def wallpaper_for(props, monitor_index, monitor_name, workspace):
+    """The image xfdesktop is actually showing on this monitor.
+
+    Two traps, both of which hand back the WRONG picture rather than nothing:
+
+      * xfconf keeps every monitor key it has ever seen. This machine has 30-odd
+        of them -- monitor0, monitorDP1-1-8, monitorLVDS1 ... -- all still
+        holding an old wallpaper, and only `monitoreDP-1` is live. So the
+        monitor NAME must be tried, and exhausted, before any index-keyed
+        fallback: matching monitor<index> first picks up a stale key that
+        happens to have an entry for the current workspace.
+      * `single-workspace-mode` is xfdesktop's default, which is why the live
+        monitor only has a workspace0 key at all. Honour it, and fall back to
+        any workspace under the right monitor before leaving the monitor.
+    """
+    single = props.get("/backdrop/single-workspace-mode", "true").lower() != "false"
+    if single:
+        try:
+            workspace = int(props.get("/backdrop/single-workspace-number", 0))
+        except ValueError:
+            workspace = 0
+
+    def pick(monitor):
+        base = f"/backdrop/screen0/monitor{monitor}/"
+        exact = base + f"workspace{workspace}/"
+        for prefix in [exact] + sorted(
+            {k.rsplit("last-image", 1)[0] for k in props
+             if k.startswith(base) and k.endswith("last-image")}
+        ):
+            image = props.get(prefix + "last-image")
+            if image and os.path.exists(image):
+                try:
+                    style = int(props.get(prefix + "image-style", 5) or 5)
+                except ValueError:
+                    style = 5
+                return image, style
+        return None
+
+    for monitor in ([monitor_name] if monitor_name else []) + [monitor_index]:
+        found = pick(monitor)
+        if found:
+            return found
+    for key, value in sorted(props.items()):
+        if key.endswith("last-image") and value and os.path.exists(value):
+            return value, 5
+    return None, 5
+
+
+def load_tile(path, width, height, style):
+    """One monitor's worth of wallpaper, rendered the way xfdesktop would.
+
+    Only the styles that can differ on a full-screen backdrop are worth
+    distinguishing: 5 (zoomed, fill and crop) is xfdesktop's default and 4
+    (scaled, fit and letterbox) is the other common one. Everything else is
+    treated as a plain stretch, which is what it looks like once the image is
+    already the size of the screen -- as it is here.
+    """
+    try:
+        src = GdkPixbuf.Pixbuf.new_from_file(path)
+    except GLib.Error:
+        return None
+    sw, sh = src.get_width(), src.get_height()
+    if sw == width and sh == height:
+        return src
+    if style == 5:                                   # zoomed: cover, then crop
+        scale = max(width / sw, height / sh)
+    elif style == 4:                                 # scaled: contain
+        scale = min(width / sw, height / sh)
+    else:
+        return src.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR)
+    tw, th = max(1, round(sw * scale)), max(1, round(sh * scale))
+    scaled = src.scale_simple(tw, th, GdkPixbuf.InterpType.BILINEAR)
+    if tw == width and th == height:
+        return scaled
+    out = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, width, height)
+    out.fill(0x000000ff)
+    ox, oy = (width - tw) // 2, (height - th) // 2
+    scaled.composite(
+        out,
+        max(0, ox), max(0, oy),
+        min(width, tw), min(height, th),
+        ox, oy, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255,
+    )
+    return out
+
+
+class Sheet(Gtk.Window):
+    def __init__(self, index, name, x, y, width, height):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.index, self.name = index, name
+        self.mx, self.my, self.mw, self.mh = x, y, width, height
+        self.tile = None
+        self.source = (None, None)   # (path, mtime)
+
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_keep_below(True)
+        self.stick()
+        self.set_app_paintable(True)
+        self.set_default_size(self.mw * TILES, self.mh)
+
+        area = Gtk.DrawingArea()
+        area.connect("draw", self.on_draw)
+        self.add(area)
+
+        self.connect("realize", self.on_realize)
+        self.connect("map-event", self.on_map)
+
+    # The window has to be placed itself: it starts one monitor to the LEFT of
+    # the monitor it covers, so the middle tile is the one on screen and there
+    # is a spare tile to slide in from either side.
+    def place(self):
+        self.move(self.mx - self.mw, self.my)
+        self.resize(self.mw * TILES, self.mh)
+
+    def make_click_through(self):
+        # Empty input shape: clicks fall through to xfdesktop, so the desktop
+        # menu and drag-select still work. This is the GTK-level call, not
+        # Gdk.Window.input_shape_combine_region -- GTK recomputes the window's
+        # shape on realize and on size-allocate, and silently drops a region
+        # set behind its back, which leaves the sheet swallowing every click on
+        # the desktop.
+        Gtk.Widget.input_shape_combine_region(self, cairo.Region())
+
+    def on_realize(self, _widget):
+        self.make_click_through()
+
+    def on_map(self, *_a):
+        self.place()
+        self.make_click_through()
+        self.get_window().lower()
+        return False
+
+    def on_draw(self, _area, cr):
+        if self.tile is None:
+            cr.set_source_rgb(0, 0, 0)
+            cr.paint()
+            return False
+        for i in range(TILES):
+            Gdk.cairo_set_source_pixbuf(cr, self.tile, i * self.mw, 0)
+            cr.paint()
+        return False
+
+    def refresh(self, props, workspace):
+        path, style = wallpaper_for(props, self.index, self.name, workspace)
+        if not path:
+            return
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return
+        if (path, mtime) == self.source:
+            return
+        tile = load_tile(path, self.mw, self.mh, style)
+        if tile is None:
+            return
+        self.tile, self.source = tile, (path, mtime)
+        self.queue_draw()
+
+
+class App:
+    def __init__(self):
+        self.sheets = []
+        self.screen = Gdk.Screen.get_default()
+        self.display = Gdk.Display.get_default()
+        self.build()
+        self.screen.connect("monitors-changed", self.on_monitors_changed)
+        self.screen.connect("size-changed", self.on_monitors_changed)
+        GLib.timeout_add_seconds(POLL_SECONDS, self.on_poll)
+
+    def current_workspace(self):
+        try:
+            out = subprocess.run(["xdotool", "get_desktop"],
+                                 capture_output=True, text=True, timeout=2).stdout
+            return int(out.strip())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 0
+
+    def build(self):
+        for sheet in self.sheets:
+            sheet.destroy()
+        self.sheets = []
+        props, workspace = xfconf_backdrop(), self.current_workspace()
+        for i in range(self.display.get_n_monitors()):
+            monitor = self.display.get_monitor(i)
+            geo = monitor.get_geometry()
+            name = monitor.get_model() or ""
+            sheet = Sheet(i, name, geo.x, geo.y, geo.width, geo.height)
+            sheet.refresh(props, workspace)
+            sheet.show_all()
+            sheet.place()
+            self.sheets.append(sheet)
+
+    def on_monitors_changed(self, *_a):
+        # Debounced: an xrandr change fires several of these in a row.
+        if getattr(self, "_rebuild", None):
+            GLib.source_remove(self._rebuild)
+        self._rebuild = GLib.timeout_add(400, self._do_rebuild)
+
+    def _do_rebuild(self):
+        self._rebuild = None
+        self.build()
+        return False
+
+    def on_poll(self):
+        props, workspace = xfconf_backdrop(), self.current_workspace()
+        for sheet in self.sheets:
+            sheet.refresh(props, workspace)
+            # xfwm can restack the below layer; keep the sheet at the bottom of
+            # it rather than assume the initial lower() holds forever.
+            win = sheet.get_window()
+            if win:
+                win.lower()
+        return True
+
+
+def main():
+    Gdk.set_program_class("wallpaper-sheet")   # picom matches class_g on this
+    GLib.set_prgname("wallpaper-sheet")
+    signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
+    signal.signal(signal.SIGTERM, lambda *_: Gtk.main_quit())
+    App()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

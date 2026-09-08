@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Wrapper around i3lock-fancy: refreshes picom's per-monitor shader defines
+# from the current xrandr layout before locking, so lock.glsl's icon effect
+# is always positioned correctly, then hands off to the real i3lock-fancy.
+set -o errexit -o nounset -o pipefail
+
+~/.config/picom/generate-monitor-defines.sh
+
+if pgrep -x picom >/dev/null; then
+  pkill -x -SIGUSR1 picom
+  sleep 0.5
+fi
+
+# Safety net: if picom isn't running (either it wasn't already, or it died
+# reloading its config, which has been observed to happen for daemonized
+# picom instances), start it fresh so the lock screen still gets a
+# compositor rather than locking with no shader/blur at all.
+if ! pgrep -x picom >/dev/null; then
+  nohup picom >/dev/null 2>&1 &
+  disown
+  sleep 0.5
+fi
+
+exec /usr/bin/i3lock-fancy "$@"

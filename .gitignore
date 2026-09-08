@@ -1,0 +1,3 @@
+# Build output -- both rebuild byte-for-byte from src/ with `make`.
+/bin/picom-menu-roll-tag
+/bin/picom-slide-fire

@@ -1,0 +1,109 @@
+#!/bin/bash
+# Directional Exposé control for skippy-xd.
+#
+# skippy-xd only offers a toggle: sending --expose to the daemon opens it when
+# closed and closes it when open. Bound naively, a swipe down would *open*
+# Exposé whenever it happened to be closed, which is not what a downward
+# gesture should ever do. This wrapper makes the two directions one-way:
+#
+#   skippy-expose open    open if closed, otherwise do nothing
+#   skippy-expose close   close if open,  otherwise do nothing
+#   skippy-expose toggle  the raw toggle, for keyboard bindings
+#
+# Activation state is read off the daemon's fullscreen window: it exists for
+# the daemon's whole lifetime but is only mapped while Exposé is showing.
+#
+# Note that `skippy-xd --expose` does not return until Exposé is dismissed, so
+# this script stays resident for the duration of a session. That is fine under
+# libinput-gestures, which spawns commands with Popen and does not wait on
+# them, so the swipe that closes Exposé is still handled while this is blocked.
+
+set -u
+
+readonly WINDOW_NAME='skippy-xd fullscreen window'
+
+# Windows to keep out of Exposé, as skippy-xd's --wm-class expression: a comma
+# separated list of partial regexes matched against both res_class and res_name,
+# where a leading '!' excludes.
+#
+# conky and wallpaper-sheet (the sliding-desktop click-through window) need to
+# be named here even though both already set _NET_WM_STATE_SKIP_PAGER and
+# _NET_WM_STATE_SKIP_TASKBAR, which skippy-xd is supposed to honour. Its check
+# (wm_validate_window in src/wm.c) reads only the *first* atom of
+# _NET_WM_STATE, and both list STICKY first, so the skip hints are never seen.
+# Filtering by class sidesteps that.
+readonly WM_FILTER=(--wm-class '!conky,!wallpaper-sheet')
+
+usage() {
+    echo "usage: ${0##*/} open|close|toggle" >&2
+    exit 2
+}
+
+# Is any skippy-xd fullscreen window currently mapped?
+expose_is_showing() {
+    local id
+    for id in $(xwininfo -root -children 2>/dev/null \
+                | awk -v n="$WINDOW_NAME" '$0 ~ "\"" n "\"" {print $1}'); do
+        if xwininfo -id "$id" 2>/dev/null | grep -q 'Map State: IsViewable'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Match on the --start-daemon argument, not just the binary name. Every client
+# invocation (--expose, --stop-daemon) is also a process called skippy-xd, so a
+# bare `pgrep -x skippy-xd` reports a daemon that is not there and we then hand
+# --expose a socket nobody is listening on. That failure is silent.
+daemon_is_running() {
+    pgrep -f -- 'skippy-xd.*--start-daemon' >/dev/null 2>&1
+}
+
+# The daemon's command fifo, whose name carries a display suffix.
+daemon_fifo_exists() {
+    local base
+    base=$(sed -nE 's/^[[:space:]]*daemonPath[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/skippy-xd/skippy-xd.rc" \
+             /etc/xdg/skippy-xd.rc 2>/dev/null | head -1)
+    base=${base:-/tmp/skippy-xd-fifo}
+    compgen -G "$base*" >/dev/null
+}
+
+# The daemon holds the window previews warm, so activation is instant. Without
+# it every invocation would cold-start and grab, far too slow to feel like a
+# gesture. Start it on demand in case autostart did not run. Wait for the fifo
+# rather than the process: the process exists a little before it is listening.
+ensure_daemon() {
+    daemon_is_running && daemon_fifo_exists && return 0
+    daemon_is_running || skippy-xd --start-daemon >/dev/null 2>&1 &
+    # Both conditions, every time round: skippy-xd does not clean up its fifos
+    # on exit, so a stale one outlives the daemon and would otherwise satisfy
+    # the wait instantly while nothing is listening.
+    local i
+    for i in $(seq 1 60); do
+        sleep 0.05
+        daemon_is_running && daemon_fifo_exists && return 0
+    done
+    return 1
+}
+
+[ $# -eq 1 ] || usage
+
+case "$1" in
+    open)
+        expose_is_showing && exit 0
+        ensure_daemon || { echo "skippy-xd daemon failed to start" >&2; exit 1; }
+        exec skippy-xd --expose "${WM_FILTER[@]}"
+        ;;
+    close)
+        expose_is_showing || exit 0
+        exec skippy-xd --expose "${WM_FILTER[@]}"
+        ;;
+    toggle)
+        ensure_daemon || { echo "skippy-xd daemon failed to start" >&2; exit 1; }
+        exec skippy-xd --expose "${WM_FILTER[@]}"
+        ;;
+    *)
+        usage
+        ;;
+esac

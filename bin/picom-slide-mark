@@ -1,0 +1,6 @@
+#!/bin/bash
+# Flag the most recent workspace switch as visually wrong. Bind to a key and
+# press it immediately after seeing a missing or backwards slide; the marker
+# lands in the log next to the SWITCH line that produced it.
+LOG="${XDG_RUNTIME_DIR:-/tmp}/picom-slide.log"
+printf '%s MARK   <<< reported wrong/missing animation\n' "$(date +%H:%M:%S.%3N)" >> "$LOG"

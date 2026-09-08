@@ -1,0 +1,11 @@
+# Excerpt from ~/.config/libinput-gestures.conf -- the picom-related lines only.
+# (lines ~209-211 in the live file)
+#
+# Three-finger horizontal swipes drive the sliding workspace switch. The
+# --dir flag tells picom-slide-switch which way the gesture went so it can
+# set _PICOM_SLIDE_STICKY on the conky cards before the switch fires; the
+# trailing number is the workspace delta.
+
+gesture swipe left /home/james/.local/bin/picom-slide-switch --wrap --dir l 1
+
+gesture swipe right /home/james/.local/bin/picom-slide-switch --wrap --dir r -1

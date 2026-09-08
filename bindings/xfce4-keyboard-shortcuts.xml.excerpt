@@ -1,0 +1,16 @@
+<!--
+  Excerpt from
+  ~/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-keyboard-shortcuts.xml
+  -- the picom-related bindings only (lines ~52, 62-63 in the live file).
+
+  These live inside:
+    <channel name="xfce4-keyboard-shortcuts" version="1.0">
+      <property name="commands" type="empty">
+        <property name="custom" type="empty">
+          ... entries below ...
+-->
+
+<property name="&lt;Primary&gt;&lt;Alt&gt;l" type="string" value="/home/james/.local/bin/lock-screen"/>
+
+<property name="&lt;Primary&gt;&lt;Alt&gt;Left" type="string" value="/home/james/.local/bin/picom-slide-switch --wrap 1"/>
+<property name="&lt;Primary&gt;&lt;Alt&gt;Right" type="string" value="/home/james/.local/bin/picom-slide-switch --wrap -1"/>

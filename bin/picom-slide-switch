@@ -1,0 +1,385 @@
+#!/bin/bash
+# Switch XFCE workspace, tagging windows first so picom knows which way to slide.
+#
+# Usage: picom-slide-switch [--wrap] [--dir l|r] <1|-1>
+#
+#   --wrap     wrap around at the first/last workspace, matching xfwm4's
+#              /general/wrap_layout. Without it, switching stops at the ends.
+#   --dir l|r  force the slide direction instead of deriving it from the delta.
+#              Needed because the two are independent: the touchpad gestures
+#              slide the content the way the fingers moved, which is the
+#              opposite of the desktop they move to (swipe left -> content
+#              travels left -> workspace to the right). The keyboard bindings
+#              omit this and take the derived default.
+#
+# Sticky windows are handled separately -- see tag_sticky/nudge_sticky below.
+#
+# The tag is the direction the *content* travels, not the desktop delta:
+#   l -> outgoing windows exit left,  incoming enter from the right
+#   r -> outgoing windows exit right, incoming enter from the left
+#   n -> neutral; matches no slide rule, so picom falls back to the normal
+#        open/show and hide animations
+#
+# Ordering matters and is guaranteed: the X server processes these property
+# writes before the _NET_CURRENT_DESKTOP message xdotool sends below, and
+# delivers both to picom's connection in that order. So picom always sees the
+# tag before xfwm4 unmaps/maps anything.
+#
+# The tag is reset to neutral once the slide has finished. Without that it stays
+# sticky, and minimizing a window later would slide it off screen instead of
+# using the normal minimize animation, since both fire picom's hide/show
+# triggers and picom cannot tell them apart.
+#
+# Every switch takes an exclusive lock, and so does the deferred reset. Without
+# it the two interleave: a reset that wakes up, passes its generation check, and
+# is midway through writing "n" when the next switch tags and switches will
+# clobber that switch's tags, and the slide silently doesn't happen. That race
+# is narrow (a few ms per switch) which is exactly why it presented as random.
+
+ANIM_SETTLE="${PICOM_SLIDE_ANIM_SETTLE:-0.4}"  # must exceed the slide duration in picom.conf (0.22)
+
+# Pause between tagging the windows and actually switching desktop.
+#
+# X guarantees picom RECEIVES the property change before the unmap, but not that
+# it APPLIES it first: picom defers re-matching window rules, so it can handle
+# the unmap while still holding the rule it matched earlier. The stale rule is
+# either "n" (no slide at all) or, if you reverse direction quickly, the opposite
+# direction (slide runs backwards). Both were observed.
+#
+# There is no way to ask picom whether it has caught up, so this is a timing
+# margin rather than a handshake. At 60Hz a frame is 16.7ms; 0.06 spans ~4
+# frames. Raise it if failures ever reappear:
+#     PICOM_SLIDE_TAG_SETTLE=0.1 picom-slide-switch --dir l 1
+TAG_SETTLE="${PICOM_SLIDE_TAG_SETTLE:-0.06}"
+TAG_SETTLE_MS=$(awk -v s="$TAG_SETTLE" 'BEGIN { printf "%d", s * 1000 }')
+
+# Minimum gap between two slides, in ms. MUST exceed the slide duration in
+# picom.conf (0.22), because a switch that fires while the previous slide is
+# still running is lost for the sticky windows: picom rebases an interrupted
+# animation instead of restarting it, and the sticky rules therefore suppress
+# their own triggers rather than be corrupted by one (see the SUPPRESSIONS note
+# in picom.conf). Real windows are immune -- each switch maps a different set of
+# them -- which is why swiping fast used to leave the cards and the wallpaper
+# standing still while everything else slid.
+#
+# Swipes that arrive early are HELD, not dropped, and the wait happens under the
+# lock so they queue in order. MAX_WAIT bounds that queue by AGE: a slide is
+# never shown more than this long after the gesture that asked for it. Swipe
+# faster than the slides can be drawn and the surplus is dropped instead of
+# banking up, so the desktop stays with your fingers rather than drifting on
+# after they stop. Raise it to trade responsiveness for honouring every swipe.
+MIN_GAP_MS="${PICOM_SLIDE_MIN_GAP:-280}"
+MAX_WAIT_MS="${PICOM_SLIDE_MAX_WAIT:-500}"
+
+# When this invocation was asked for -- before the lock, so it counts the time
+# spent queued behind other swipes as well as the pacing wait.
+INVOKED=$(date +%s%N)
+
+# Sticky windows (the conky cards and the wallpaper sheet) can't be tagged the
+# same way: they live on every desktop, so xfwm4 never unmaps them and picom's hide/show
+# triggers never fire for them. picom.conf animates them off the
+# increase-opacity/decrease-opacity triggers instead, and the way to fire one
+# of those on demand is to write a different _NET_WM_WINDOW_OPACITY.
+#
+# The nudge is a change AROUND a base level, not a fixed pair of values. Each
+# switch subtracts one of two tiny offsets from the class's base, so the value
+# always changes (that is the trigger) while the level the window is actually
+# displayed at does not move perceptibly: the offsets are 0.4% and 0.8% apart.
+# Two OFF-values rather than a toggle against the base itself, so that a card
+# which has just restarted -- no opacity property at all, i.e. sitting at
+# exactly the base -- still sees a change on the very first switch.
+#
+# Why a base at all: ~/.config/conky/gruvbox-dark/bin/focusdim.py fades the
+# cards back while a window has the focus, and it does that through the same
+# property. Nudging to a fixed ~1.0 would undo the fade for the length of every
+# slide. So the cards are nudged around whatever level focusdim.py publishes
+# and the wallpaper sheet, which nothing fades, stays at opaque -- which is why
+# the base is per class.
+#
+# The conky cards, and the sliding wallpaper (~/.local/bin/wallpaper-sheet).
+# Both are sticky, both are animated by the nudge below, and picom tells them
+# apart by class -- the cards hand over between two copies of themselves, the
+# wallpaper just slides one tile.
+STICKY_CLASSES="${PICOM_SLIDE_STICKY_CLASSES:-conky wallpaper-sheet}"
+STICKY_OPAQUE=4294967295  # 0xFFFFFFFF
+STICKY_D0=16843009        # 0x01010101
+STICKY_D1=33686018        # 0x02020202
+
+# The switch and the nudge have to reach the X server together, or the cards
+# set off after the windows and the stack visibly breaks formation -- which is
+# the one thing the sliding is supposed to preserve. Six separate processes
+# (xdotool + one xprop per card) cannot do that: measured over eight switches,
+# the cards started 0-30 ms after the windows, and in three of them one card
+# started 25-52 ms after its siblings. picom-slide-fire does the whole lot from
+# a single X connection instead. Source and build line:
+# ~/.local/src/picom-slide-fire.c. Without it everything still works, just with
+# that jitter back.
+FIRE="${PICOM_SLIDE_FIRE:-$HOME/.local/bin/picom-slide-fire}"
+
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}"
+GEN_FILE="$RUNDIR/picom-slide.gen"
+STICKY_OP_FILE="$RUNDIR/picom-slide.sticky-op"
+LOCK_FILE="$RUNDIR/picom-slide.lock"
+LOG_FILE="$RUNDIR/picom-slide.log"
+LAST_FILE="$RUNDIR/picom-slide.last"
+# Written by focusdim.py: the opacity the conky cards should be sitting at.
+DIM_LEVEL_FILE="$RUNDIR/conky-gruvbox/dim-level"
+FIRED_FILE="$RUNDIR/picom-slide.fired"   # when the last slide actually started
+WORK_FILE="$RUNDIR/picom-slide.work"     # how long the run-up to a slide took
+LOG_MAX=300
+
+usage() {
+	echo "usage: ${0##*/} [--wrap] [--dir l|r] <1|-1>" >&2
+	exit 1
+}
+
+log() {
+	printf '%s %s\n' "$(date +%H:%M:%S.%3N)" "$*" >> "$LOG_FILE"
+}
+
+# Tag the windows that will actually animate: those on the desktop being left
+# and the one being entered. Takes the direction and a window list ($2). Sticky windows (desktop -1, the panel and desktop)
+# are never unmapped, so they never fire a trigger and don't need tagging.
+# Echoes "<tagged> <candidates>". Zero candidates means both desktops are empty,
+# which is a legitimate nothing-to-animate case rather than a failure; tagged
+# falling short of candidates is a real problem.
+tag_switching() {
+	local n=0 c=0 id
+	for id in $(awk -v a="$cur" -v b="$target" '$2==a || $2==b {print $1}' <<< "$2"); do
+		c=$((c + 1))
+		xprop -id "$id" -f _PICOM_SLIDE 8s -set _PICOM_SLIDE "$1" 2>/dev/null && n=$((n + 1))
+	done
+	echo "$n $c"
+}
+
+tag_everything() {
+	local id
+	for id in $(wmctrl -l | awk '{print $1}'); do
+		xprop -id "$id" -f _PICOM_SLIDE 8s -set _PICOM_SLIDE "$1" 2>/dev/null
+	done
+}
+
+# One window list per switch, shared by both taggers. Asking twice (this used to
+# be an `xdotool search --class`) costs another ~30ms of swipe latency before
+# anything moves, and lets the two lists disagree about what is on screen.
+window_list() {
+	wmctrl -lx
+}
+
+# The sticky windows in a window list ($1), matched on the class half of
+# wmctrl's instance.class column. $2 narrows it to one class; without it every
+# sticky class is returned.
+sticky_ids() {
+	awk -v classes="${2:-$STICKY_CLASSES}" '
+		BEGIN { n = split(tolower(classes), want, " "); for (i = 1; i <= n; i++) keep[want[i]] = 1 }
+		{ m = split($3, a, "."); if (tolower(a[m]) in keep) print $1 }' <<< "$1"
+}
+
+# Same tag, different property: _PICOM_SLIDE_STICKY, so a sticky card can never
+# match the show/hide rules meant for real windows (and vice versa).
+tag_sticky() {
+	local tag="$1" id pids=()
+	shift
+	for id in "$@"; do
+		xprop -id "$id" -f _PICOM_SLIDE_STICKY 8s -set _PICOM_SLIDE_STICKY "$tag" 2>/dev/null &
+		pids+=($!)
+	done
+	wait "${pids[@]}" 2>/dev/null
+}
+
+# Which of the two offsets this switch uses -- alternated so consecutive
+# switches always differ. Shared by every class, so they all nudge together.
+sticky_ix() {
+	local ix
+	if [ "$(cat "$STICKY_OP_FILE" 2>/dev/null)" = "0" ]; then ix=1; else ix=0; fi
+	echo "$ix" > "$STICKY_OP_FILE"
+	echo "$ix"
+}
+
+# The base opacity a class is nudged around. Only the cards have one that
+# moves; everything else sits at opaque.
+sticky_base() {
+	local v
+	case "$1" in
+	conky)
+		v=$(cat "$DIM_LEVEL_FILE" 2>/dev/null)
+		# Absent (focusdim.py not running) or corrupt reads as opaque, which
+		# is exactly the old fixed behaviour -- so the slide never depends on
+		# the dimmer being there.
+		case "$v" in
+		''|*[!0-9]*) echo "$STICKY_OPAQUE" ;;
+		*) if [ "$v" -ge 0 ] && [ "$v" -le "$STICKY_OPAQUE" ]; then
+			   echo "$v"
+		   else
+			   echo "$STICKY_OPAQUE"
+		   fi ;;
+		esac ;;
+	*)  echo "$STICKY_OPAQUE" ;;
+	esac
+}
+
+# base ($1) less this switch's offset ($2), floored at 0.
+sticky_op_for() {
+	local d
+	if [ "$2" = 0 ]; then d="$STICKY_D0"; else d="$STICKY_D1"; fi
+	if [ "$1" -gt "$d" ]; then echo $(( $1 - d )); else echo 0; fi
+}
+
+# Fallback path, used only when picom-slide-fire is missing. Takes the same
+# "--opacity V -- ids..." groups the real thing does. Parallel rather than a
+# loop: five serial xprop spawns take ~50ms, a quarter of the slide.
+nudge_sticky() {
+	local op=0 id pids=()
+	for id in "$@"; do
+		case "$id" in
+		--opacity) op=NEXT; continue ;;
+		--) continue ;;
+		esac
+		if [ "$op" = NEXT ]; then op="$id"; continue; fi
+		xprop -id "$id" -f _NET_WM_WINDOW_OPACITY 32c -set _NET_WM_WINDOW_OPACITY "$op" 2>/dev/null &
+		pids+=($!)
+	done
+	wait "${pids[@]}" 2>/dev/null
+}
+
+wrap=0
+dir=
+
+while :; do
+	case "$1" in
+		--wrap) wrap=1; shift ;;
+		--dir)  dir="$2"; shift 2 ;;
+		*)      break ;;
+	esac
+done
+
+delta="$1"
+
+case "$delta" in
+	1)  : "${dir:=r}" ;;
+	-1) : "${dir:=l}" ;;
+	*)  usage ;;
+esac
+
+case "$dir" in
+	l|r) ;;
+	*)   usage ;;
+esac
+
+{
+	flock 9
+
+	# Hold this switch back until the previous slide has finished. Everything
+	# below -- reading the current desktop included -- happens after the wait,
+	# so a swipe that queued behind another still switches from wherever the
+	# desktop actually ended up.
+	now=$(date +%s%N)
+	fired=$(cat "$FIRED_FILE" 2>/dev/null || echo 0)
+	wait_ms=$(( (fired + MIN_GAP_MS * 1000000 - now) / 1000000 ))
+	age_ms=$(( (now - INVOKED) / 1000000 ))
+	delay_ms=$(( age_ms + (wait_ms > 0 ? wait_ms : 0) ))
+	if [ "$delay_ms" -gt "$MAX_WAIT_MS" ]; then
+		log "DROP   delta=$delta dir=$dir (${delay_ms}ms late: queued ${age_ms}ms, ${wait_ms}ms still to wait; swiping faster than the slides can be drawn)"
+		exit 0
+	fi
+	# Everything between here and the nudge -- reading the desktop, listing
+	# windows, tagging, the tag settle -- is part of the gap, not extra on top
+	# of it, so the wait is shortened by however long that run-up took last
+	# time. Measuring it rather than assuming keeps the gap equal to
+	# MIN_GAP_MS whatever the machine is doing; assuming only the settle left
+	# the slides ~305ms apart when 240 was asked for.
+	work_ms=$(cat "$WORK_FILE" 2>/dev/null || echo "$TAG_SETTLE_MS")
+	pre_ms=$(( wait_ms - work_ms ))
+	if [ "$pre_ms" -gt 0 ]; then
+		sleep "$(printf '%d.%03d' $((pre_ms / 1000)) $((pre_ms % 1000)))"
+	fi
+
+	t0=$(date +%s%N)
+	cur=$(xdotool get_desktop)
+	num=$(xdotool get_num_desktops)
+	target=$((cur + delta))
+
+	if [ "$wrap" = 1 ]; then
+		target=$(( (target % num + num) % num ))
+	elif [ "$target" -lt 0 ]; then
+		target=0
+	elif [ "$target" -ge "$num" ]; then
+		target=$((num - 1))
+	fi
+
+	# Already at the end with no wrapping: nothing moves, so no animation is
+	# possible. Logged because it looks identical to a failed slide.
+	if [ "$target" = "$cur" ]; then
+		log "NOOP  delta=$delta dir=$dir desktop=$cur/$num wrap=$wrap (at boundary, nothing to animate)"
+		exit 0
+	fi
+
+	# Claim this switch. The deferred reset below re-reads this under the lock
+	# and bows out if a newer switch has taken over.
+	gen="$$-$(date +%s%N)"
+	echo "$gen" > "$GEN_FILE"
+
+	wl=$(window_list)
+	read -r tagged candidates <<< "$(tag_switching "$dir" "$wl")"
+	sticky=$(sticky_ids "$wl")
+	tag_sticky "$dir" $sticky
+	# Give picom time to re-match its rules before the unmap arrives. Inside the
+	# lock, so a pending reset still cannot interleave with this.
+	sleep "$TAG_SETTLE"
+	# One "--opacity V -- ids" group per sticky class, because their bases
+	# differ (see the STICKY_* notes above). Built here rather than inside the
+	# branch so both paths take the same argument list.
+	ix=$(sticky_ix)
+	nudge=()
+	for cls in $STICKY_CLASSES; do
+		cls_ids=$(sticky_ids "$wl" "$cls")
+		[ -n "$cls_ids" ] || continue
+		nudge+=(--opacity "$(sticky_op_for "$(sticky_base "$cls")" "$ix")" -- $cls_ids)
+	done
+	if [ -x "$FIRE" ]; then
+		# One connection: the switch and every card's nudge are queued back
+		# to back and the server keeps them in order, so picom sees them all
+		# in the same frame and the cards leave with the windows.
+		"$FIRE" --desktop "$target" "${nudge[@]}"; rc=$?
+	else
+		xdotool set_desktop "$target"; rc=$?
+		nudge_sticky "${nudge[@]}"
+	fi
+	t1=$(date +%s%N)
+	echo "$t1" > "$FIRED_FILE"
+	echo $(( (t1 - t0) / 1000000 )) > "$WORK_FILE"
+
+	ms=$(( (t1 - t0) / 1000000 ))
+	if [ "$candidates" -eq 0 ]; then
+		log "EMPTY  delta=$delta dir=$dir $cur->$target (both desktops empty, nothing to animate)"
+	elif [ "$tagged" -lt "$candidates" ]; then
+		log "WARN   delta=$delta dir=$dir $cur->$target tagged=$tagged/$candidates rc=$rc ${ms}ms (some windows untagged, slide will be partial)"
+	else
+		# Gap since the previous switch, for correlating failures against
+		# swipe cadence and direction reversals.
+		now=$(date +%s%N); prev=$(cat "$LAST_FILE" 2>/dev/null || echo "$now")
+		gap=$(( (now - prev) / 1000000 )); echo "$now" > "$LAST_FILE"
+		held=$(( wait_ms > 0 ? wait_ms : 0 ))
+		log "SWITCH delta=$delta dir=$dir $cur->$target tagged=$tagged sticky=$(echo $sticky | wc -w) rc=$rc ${ms}ms settle=$TAG_SETTLE gap=${gap}ms held=${held}ms late=${delay_ms}ms"
+	fi
+} 9>"$LOCK_FILE"
+
+(
+	sleep "$ANIM_SETTLE"
+	{
+		flock 9
+		if [ "$(cat "$GEN_FILE" 2>/dev/null)" = "$gen" ]; then
+			tag_everything n
+			# Re-looked-up rather than reusing $sticky: a card may have
+			# restarted since the switch. Resetting to n is what stops a
+			# later opacity change (picom-trans, another tool) from
+			# replaying the slide on the widgets.
+			tag_sticky n $(sticky_ids "$(window_list)")
+		fi
+		if [ "$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
+			tail -n "$LOG_MAX" "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+		fi
+	} 9>"$LOCK_FILE"
+) &
+
+exit 0

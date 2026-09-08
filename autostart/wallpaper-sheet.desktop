@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Wallpaper sheet
+Comment=Repeating wallpaper copy so the backdrop can slide with a workspace switch
+Exec=/home/james/.local/bin/wallpaper-sheet
+OnlyShowIn=XFCE;
+StartupNotify=false
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true

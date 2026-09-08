@@ -1,0 +1,13 @@
+[Unit]
+Description=picom-menu-roll-tag - tags popup/dropdown menus with real cursor-relative roll direction for picom
+Documentation=file:///home/james/.local/src/picom-menu-roll-tag.c
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/picom-menu-roll-tag
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target
