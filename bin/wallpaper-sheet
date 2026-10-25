@@ -19,6 +19,14 @@ Details that matter:
 
   * It is CLICK-THROUGH (empty input shape), so the desktop right-click menu
     still belongs to xfdesktop underneath.
+  * Its visible shape is cut wherever ANOTHER monitor sits. Each sheet's spare
+    tiles otherwise lie on top of the neighbouring monitor, so with two side
+    by side the sheets overlap on both screens and whichever is stacked higher
+    wins on both. Any difference between them -- image-style, a few px of
+    vertical offset -- then shows as the whole desktop flickering every time
+    the poll below re-lowers them, because lowering one and then the other
+    briefly puts the wrong one on top. Cut, the sheets tile edge to edge and
+    the stacking order between them stops mattering.
   * It sits in the WM's "below" layer -- above the backdrop, below every
     application window -- which is the same trick the conky cards use.
   * Desktop ICONS are drawn on xfdesktop's own window and would be covered by
@@ -153,10 +161,11 @@ def load_tile(path, width, height, style):
 
 
 class Sheet(Gtk.Window):
-    def __init__(self, index, name, x, y, width, height):
+    def __init__(self, index, name, x, y, width, height, others=()):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.index, self.name = index, name
         self.mx, self.my, self.mw, self.mh = x, y, width, height
+        self.others = others         # other monitors' (x, y, w, h)
         self.tile = None
         self.source = (None, None)   # (path, mtime)
 
@@ -194,12 +203,25 @@ class Sheet(Gtk.Window):
         # the desktop.
         Gtk.Widget.input_shape_combine_region(self, cairo.Region())
 
+    def cut_other_monitors(self):
+        # Bounding shape, in window coordinates at rest. picom slides the
+        # shaped window as a whole, so the cut travels with it -- what slides
+        # in from a neighbouring monitor's side is that monitor's own sheet,
+        # which is the strip continuing. Same GTK-level caveat as above.
+        ox, oy = self.mx - self.mw, self.my
+        region = cairo.Region(cairo.RectangleInt(0, 0, self.mw * TILES, self.mh))
+        for x, y, w, h in self.others:
+            region.subtract(cairo.RectangleInt(x - ox, y - oy, w, h))
+        Gtk.Widget.shape_combine_region(self, region)
+
     def on_realize(self, _widget):
         self.make_click_through()
+        self.cut_other_monitors()
 
     def on_map(self, *_a):
         self.place()
         self.make_click_through()
+        self.cut_other_monitors()
         self.get_window().lower()
         return False
 
@@ -253,11 +275,14 @@ class App:
             sheet.destroy()
         self.sheets = []
         props, workspace = xfconf_backdrop(), self.current_workspace()
-        for i in range(self.display.get_n_monitors()):
-            monitor = self.display.get_monitor(i)
-            geo = monitor.get_geometry()
+        monitors = [self.display.get_monitor(i)
+                    for i in range(self.display.get_n_monitors())]
+        rects = [(g.x, g.y, g.width, g.height)
+                 for g in (m.get_geometry() for m in monitors)]
+        for i, monitor in enumerate(monitors):
             name = monitor.get_model() or ""
-            sheet = Sheet(i, name, geo.x, geo.y, geo.width, geo.height)
+            others = rects[:i] + rects[i + 1:]
+            sheet = Sheet(i, name, *rects[i], others)
             sheet.refresh(props, workspace)
             sheet.show_all()
             sheet.place()
